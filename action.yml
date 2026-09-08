@@ -46,6 +46,14 @@ inputs:
     description: Duration (in seconds) before checking the status of kernel execution completion
     required: false
     default: 15
+  accelerator:
+    description: 'Optional GPU accelerator for the kernel: nvidiaTeslaT4 or nvidiaTeslaP100. Leave empty for Kaggle default (P100). Use nvidiaTeslaT4 for recent PyTorch builds (P100 sm_60 no longer ships CUDA kernels).'
+    required: false
+    default: ""
+  max_poll_minutes:
+    description: 'Maximum time (in minutes) to poll kernel status. On timeout, the action checks the kernel output log for a completion marker before failing.'
+    required: false
+    default: "30"
   working_subdir:
     description: Subdirectory inside /kaggle/working/$REPO_NAME where dependencies are installed and the custom script is run
     required: false
@@ -205,6 +213,7 @@ runs:
                                          --argjson enable_gpu "${{ inputs.enable_gpu }}" \
                                          --argjson enable_internet "${{ inputs.enable_internet }}" \
                                          --argjson enable_tpu "${{ inputs.enable_tpu }}" \
+                                         --arg accelerator "${{ inputs.accelerator }}" \
                                          '. |
                                            .id = $id |
                                            .title = $title |
@@ -213,7 +222,8 @@ runs:
                                            .kernel_type = "notebook" |
                                            .enable_gpu = $enable_gpu |
                                            .enable_internet = $enable_internet |
-                                           .enable_tpu = $enable_tpu')
+                                           .enable_tpu = $enable_tpu |
+                                           (if $accelerator == "" then del(.accelerator) else .accelerator = $accelerator end)')
         
         echo "Saving updated metadata back to $json_path"
         echo "$metadata" | jq '.' > "$json_path"
@@ -241,27 +251,51 @@ runs:
             echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
         }
         
+        max_poll_minutes="${{ inputs.max_poll_minutes }}"
+        deadline=$(( $(date +%s) + max_poll_minutes * 60 ))
+        poll_timed_out=0
+        
         while true; do
             log_message "Retrieving kernel status..."
             status=$(kaggle kernels status "$kernel_name" 2>&1)
+            # kaggle CLI 2.x (kagglesdk) outputs statuses in UpperCase, e.g. KernelWorkerStatus.COMPLETE.
+            # Older CLI printed lowercase. Compare case-insensitively to support both.
+            status_lc=$(echo "$status" | tr '[:upper:]' '[:lower:]')
         
-            if [[ "$status" == *"403"* || "$status" == *"denied"* ]]; then
+            if [[ "$status_lc" == *"403"* || "$status_lc" == *"denied"* ]]; then
                 log_message "::error::Access denied or kernel not found. Check if the API key has permissions and if the kernel name is correct."
                 exit 1
-            elif [[ "$status" == *"error"* ]]; then
+            elif [[ "$status_lc" == *"error"* ]]; then
                 log_message "::error::FAIL: Script(s) execution failed."
                 exit 1
-            elif [[ "$status" == *"cancel"* ]]; then
+            elif [[ "$status_lc" == *"cancel"* ]]; then
                 log_message "::error::FAIL: Script(s) failed. The Kaggle kernel has been canceled."
                 exit 1
-            elif [[ "$status" == *"complete"* ]]; then
+            elif [[ "$status_lc" == *"complete"* ]]; then
                 log_message "SUCCESS: Script execution completed successfully!"
                 break
             else
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                    log_message "Polling exceeded ${max_poll_minutes} minutes. Breaking out of the poll loop to verify the real kernel state..."
+                    poll_timed_out=1
+                    break
+                fi
                 log_message "Kernel is still running. Rechecking in "${{ inputs.sleep_time }}" seconds..."
                 sleep "${{ inputs.sleep_time }}"
             fi
         done
+        
+        if [ "$poll_timed_out" -eq 1 ]; then
+            log_message "Status stayed non-terminal for ${max_poll_minutes} minutes. Fetching kernel output to check whether the run actually finished (Kaggle sessions can linger)..."
+            kaggle kernels output "$kernel_name" -p . 2>&1 | tail -n 3 || true
+            log_file="./$kernel_slug.log"
+            if [ -f "$log_file" ] && grep -q "__results__.html" "$log_file"; then
+                log_message "WARNING: The kernel run itself finished (end-of-run marker '__results__.html' found in log) but Kaggle status never left 'running'. Treating as complete."
+            else
+                log_message "::error::Kernel still running after ${max_poll_minutes} minutes and no completion marker found in its log."
+                exit 1
+            fi
+        fi
         
         log_file="./$kernel_slug.log"
         
@@ -270,17 +304,25 @@ runs:
         kaggle kernels output "$kernel_name" -p . 2>&1
         
         if [ -f "$log_file" ]; then
-            tail -n 50 "$log_file" | jq -c '.[]' | while IFS= read -r entry; do
-                data_field=$(echo "$entry" | jq -r '.data')
+            # Parse the last 60 entries; fall back to raw tail if the file is not valid JSON.
+            errors_found=0
+            while IFS= read -r entry; do
+                data_field=$(echo "$entry" | jq -r '.data // empty' 2>/dev/null) || data_field=""
                 [[ -n "$data_field" ]] && log_message "$data_field"
                 
-                if echo "$data_field" | grep -Ei "Error|Traceback|Exception|404 Client Error|failed|FAIL"; then
+                if echo "$data_field" | grep -Eiq "Error|Traceback|Exception|404 Client Error|failed|FAIL"; then
                     log_message "::error::Error found in log: $data_field"
-                    exit 1
+                    errors_found=1
                 fi
-            done
+            done < <(tail -n 60 "$log_file" | jq -c '.[-60:][]' 2>/dev/null || tail -n 20 "$log_file")
+            log_message "::endgroup::"
+            if [ "$errors_found" -eq 1 ]; then
+                log_message "::error::Kernel completed but errors were found in its log. Failing the job."
+                exit 1
+            fi
         else
             log_message "Log file '$log_file' not found."
+            log_message "::endgroup::"
         fi
         
         log_message "::endgroup::"
