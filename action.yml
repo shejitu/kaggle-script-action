@@ -237,8 +237,17 @@ runs:
         cat "$json_path"  
         
         log_message "Pushing Kaggle kernel with updated metadata..."
-        kaggle kernels push -p "$action_path"
-        
+        push_out=$(kaggle kernels push -p "$action_path" 2>&1) || push_rc=$?
+        log_message "$push_out"
+        if [ -n "$push_rc" ] && [ "$push_rc" -ne 0 ]; then
+            log_message "::error::Kernel push failed (exit $push_rc). Common causes: GPU session quota reached ('Maximum batch GPU session count'), invalid metadata, or missing data sources."
+            exit 1
+        fi
+        if echo "$push_out" | grep -qi "push error\|error pushing"; then
+            log_message "::error::Kernel push reported an error (see above). Aborting instead of proceeding to status polling."
+            exit 1
+        fi
+
         log_message "Kaggle kernel setup and push completed successfully."
 
     - name: Check status
