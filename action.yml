@@ -47,7 +47,7 @@ inputs:
     required: false
     default: 15
   accelerator:
-    description: 'Optional GPU accelerator for the kernel: nvidiaTeslaT4 or nvidiaTeslaP100. Leave empty for Kaggle default (P100). Use nvidiaTeslaT4 for recent PyTorch builds (P100 sm_60 no longer ships CUDA kernels).'
+    description: 'Optional GPU accelerator for the kernel: nvidiaTeslaT4 or nvidiaTeslaP100 (case-insensitive). Leave empty for Kaggle default (P100). Use nvidiaTeslaT4 for recent PyTorch builds (P100 sm_60 no longer ships CUDA kernels). Written to kernel metadata as "machine_shape" (the field kaggle CLI 2.x actually sends).'
     required: false
     default: ""
   max_poll_minutes:
@@ -223,7 +223,12 @@ runs:
                                            .enable_gpu = $enable_gpu |
                                            .enable_internet = $enable_internet |
                                            .enable_tpu = $enable_tpu |
-                                           (if $accelerator == "" then del(.accelerator) else .accelerator = $accelerator end)')
+                                           (if $accelerator == "" then del(.machine_shape)
+                                            else .machine_shape = (if ($accelerator | ascii_downcase) == "nvidiateslat4" then "NvidiaTeslaT4"
+                                                                   elif ($accelerator | ascii_downcase) == "nvidiateslap100" then "NvidiaTeslaP100"
+                                                                   elif ($accelerator | ascii_downcase) == "tpu1vmv38" then "Tpu1VmV38"
+                                                                   else $accelerator end)
+                                            end)')
         
         echo "Saving updated metadata back to $json_path"
         echo "$metadata" | jq '.' > "$json_path"
@@ -304,17 +309,16 @@ runs:
         kaggle kernels output "$kernel_name" -p . 2>&1
         
         if [ -f "$log_file" ]; then
-            # Parse the last 60 entries; fall back to raw tail if the file is not valid JSON.
+            # The kernel log is a JSON array whose tail is often truncated, which breaks
+            # per-entry jq parsing. Grep the raw text instead - it contains the same content.
             errors_found=0
-            while IFS= read -r entry; do
-                data_field=$(echo "$entry" | jq -r '.data // empty' 2>/dev/null) || data_field=""
-                [[ -n "$data_field" ]] && log_message "$data_field"
-                
-                if echo "$data_field" | grep -Eiq "Error|Traceback|Exception|404 Client Error|failed|FAIL"; then
-                    log_message "::error::Error found in log: $data_field"
-                    errors_found=1
-                fi
-            done < <(tail -n 60 "$log_file" | jq -c '.[-60:][]' 2>/dev/null || tail -n 20 "$log_file")
+            matches=$(grep -Eai -m 5 "Traceback|Error|Exception|404 Client Error|failed|FAIL" "$log_file" || true)
+            if [ -n "$matches" ]; then
+                errors_found=1
+                log_message "::group::Error lines found in kernel log"
+                echo "$matches"
+                log_message "::endgroup::"
+            fi
             log_message "::endgroup::"
             if [ "$errors_found" -eq 1 ]; then
                 log_message "::error::Kernel completed but errors were found in its log. Failing the job."
